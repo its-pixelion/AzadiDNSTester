@@ -52,18 +52,26 @@ function Get-IPv4Addresses {
     if (-not (Test-Path $FilePath)) {
         return @()
     }
-    
-    $content = Get-Content $FilePath -Raw
+
+    # Stream parsing to avoid loading huge files into memory and to reduce the
+    # "stuck" feeling when dns_servers.txt is large.
     $ipPattern = '\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
-    
-    $matches = [regex]::Matches($content, $ipPattern)
-    $allIps = $matches | ForEach-Object { $_.Value }
-    $uniqueIps = $allIps | Select-Object -Unique
-    
+    $ipRegex = [regex]::new($ipPattern)
+
+    $uniqueSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $totalCount = 0
+
+    foreach ($line in (Get-Content -Path $FilePath -ReadCount 2000)) {
+        foreach ($m in $ipRegex.Matches(($line -join "`n"))) {
+            $totalCount++
+            [void]$uniqueSet.Add($m.Value)
+        }
+    }
+
     return @{
-        UniqueIPs = @($uniqueIps)
-        TotalCount = $allIps.Count
-        UniqueCount = $uniqueIps.Count
+        UniqueIPs = @($uniqueSet)
+        TotalCount = $totalCount
+        UniqueCount = $uniqueSet.Count
     }
 }
 
@@ -121,6 +129,51 @@ function Save-WorkingServer {
     }
 }
 
+function Invoke-NslookupQuery {
+    param(
+        [string]$Server,
+        [string]$Domain,
+        [int]$TimeoutSeconds
+    )
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "nslookup"
+    $psi.Arguments = "$Domain $Server"
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    $process.Start() | Out-Null
+    $script:NslookupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    $completed = $process.WaitForExit([math]::Max(1, $TimeoutSeconds) * 1000)
+    $script:NslookupStopwatch.Stop()
+    if (-not $completed) {
+        try { $process.Kill() } catch { }
+        return @{ Success = $false; ResolvedIP = $null; Error = "Timeout" }
+    }
+
+    if ($process.ExitCode -ne 0) {
+        return @{ Success = $false; ResolvedIP = $null; Error = "nslookup error" }
+    }
+
+    $output = $process.StandardOutput.ReadToEnd()
+    $addresses = [regex]::Matches($output, '(?im)^Address(?:es)?:\s*(\d+\.\d+\.\d+\.\d+)')
+    if ($addresses.Count -ge 2) {
+        # First is usually the DNS server IP; later ones are answers.
+        return @{ Success = $true; ResolvedIP = $addresses[$addresses.Count - 1].Groups[1].Value; Error = $null }
+    }
+    elseif ($addresses.Count -eq 1) {
+        # Sometimes nslookup only prints one Address line; treat as success but uncertain.
+        return @{ Success = $true; ResolvedIP = $addresses[0].Groups[1].Value; Error = $null }
+    }
+
+    return @{ Success = $false; ResolvedIP = $null; Error = "No answer" }
+}
+
 # ==============================================================================
 # DNS Testing Functions
 # ==============================================================================
@@ -140,68 +193,27 @@ function Test-DnsServer {
         Error = $null
     }
     
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    
     try {
-        # Try Resolve-DnsName first (Windows 8+ / Server 2012+)
-        if (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue) {
-            $dnsResult = Resolve-DnsName -Name $Domain -Server $Server -Type A -DnsOnly -ErrorAction Stop
-            $stopwatch.Stop()
-            
-            $aRecords = $dnsResult | Where-Object { $_.Type -eq 'A' }
-            if ($aRecords) {
-                $result.Success = $true
-                $result.ResolvedIP = $aRecords[0].IPAddress
-                $result.ResponseTime = [math]::Round($stopwatch.ElapsedMilliseconds)
-            }
+        # Use nslookup so we can enforce TimeoutSeconds (Resolve-DnsName can hang).
+        $q = Invoke-NslookupQuery -Server $Server -Domain $Domain -TimeoutSeconds $TimeoutSeconds
+
+        if ($q.Success) {
+            $result.Success = $true
+            $result.ResolvedIP = $q.ResolvedIP
+            $result.ResponseTime = [math]::Round($script:NslookupStopwatch.ElapsedMilliseconds)
         }
         else {
-            # Fallback to .NET DNS (less control over server)
-            # Note: This doesn't allow specifying a custom DNS server easily
-            # We'll use nslookup via process
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = "nslookup"
-            $psi.Arguments = "$Domain $Server"
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError = $true
-            $psi.UseShellExecute = $false
-            $psi.CreateNoWindow = $true
-            
-            $process = New-Object System.Diagnostics.Process
-            $process.StartInfo = $psi
-            $process.Start() | Out-Null
-            
-            $completed = $process.WaitForExit($TimeoutSeconds * 1000)
-            $stopwatch.Stop()
-            
-            if ($completed -and $process.ExitCode -eq 0) {
-                $output = $process.StandardOutput.ReadToEnd()
-                
-                # Parse nslookup output for IP address
-                if ($output -match 'Address:\s*(\d+\.\d+\.\d+\.\d+)') {
-                    # Skip the first Address line (server's address)
-                    $addresses = [regex]::Matches($output, 'Address:\s*(\d+\.\d+\.\d+\.\d+)')
-                    if ($addresses.Count -gt 1) {
-                        $result.Success = $true
-                        $result.ResolvedIP = $addresses[1].Groups[1].Value
-                        $result.ResponseTime = [math]::Round($stopwatch.ElapsedMilliseconds)
-                    }
-                }
-            }
-            else {
-                if (-not $completed) {
-                    $process.Kill()
-                    $result.Error = "Timeout"
-                }
-            }
+            $result.Error = $q.Error
         }
     }
     catch [System.Management.Automation.CommandNotFoundException] {
         $result.Error = "No DNS tool available"
     }
     catch {
-        $stopwatch.Stop()
-        $result.ResponseTime = [math]::Round($stopwatch.ElapsedMilliseconds)
+        if ($script:NslookupStopwatch) {
+            $script:NslookupStopwatch.Stop()
+            $result.ResponseTime = [math]::Round($script:NslookupStopwatch.ElapsedMilliseconds)
+        }
         $result.Error = $_.Exception.Message
         if ($result.Error.Length -gt 30) {
             $result.Error = $result.Error.Substring(0, 30) + "..."
@@ -286,6 +298,106 @@ function Get-TestDomain {
 # Parallel Execution Functions
 # ==============================================================================
 
+# Build a minimal DNS query packet for A record lookup
+function Build-DnsQuery {
+    param([string]$Domain)
+    
+    # Transaction ID (random)
+    $id = [byte[]]@((Get-Random -Maximum 256), (Get-Random -Maximum 256))
+    
+    # Flags: standard query, recursion desired
+    $flags = [byte[]]@(0x01, 0x00)
+    
+    # Questions: 1, Answers: 0, Authority: 0, Additional: 0
+    $counts = [byte[]]@(0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+    
+    # Encode domain name
+    $domainBytes = [System.Collections.Generic.List[byte]]::new()
+    foreach ($label in $Domain.Split('.')) {
+        $domainBytes.Add([byte]$label.Length)
+        $domainBytes.AddRange([System.Text.Encoding]::ASCII.GetBytes($label))
+    }
+    $domainBytes.Add(0x00)  # Null terminator
+    
+    # Query type (A = 1) and class (IN = 1)
+    $queryType = [byte[]]@(0x00, 0x01, 0x00, 0x01)
+    
+    # Combine all parts
+    $query = [System.Collections.Generic.List[byte]]::new()
+    $query.AddRange($id)
+    $query.AddRange($flags)
+    $query.AddRange($counts)
+    $query.AddRange($domainBytes)
+    $query.AddRange($queryType)
+    
+    return @{ Packet = $query.ToArray(); TransactionId = $id }
+}
+
+# Parse DNS response to extract IP addresses
+function Parse-DnsResponse {
+    param([byte[]]$Response, [byte[]]$ExpectedId)
+    
+    if ($Response.Length -lt 12) { return $null }
+    
+    # Verify transaction ID
+    if ($Response[0] -ne $ExpectedId[0] -or $Response[1] -ne $ExpectedId[1]) {
+        return $null
+    }
+    
+    # Check response code (RCODE in lower 4 bits of byte 3)
+    $rcode = $Response[3] -band 0x0F
+    if ($rcode -ne 0) { return $null }
+    
+    # Get answer count
+    $answerCount = ($Response[6] -shl 8) + $Response[7]
+    if ($answerCount -eq 0) { return $null }
+    
+    # Skip header (12 bytes) and question section
+    $pos = 12
+    
+    # Skip question name
+    while ($pos -lt $Response.Length -and $Response[$pos] -ne 0) {
+        if (($Response[$pos] -band 0xC0) -eq 0xC0) {
+            $pos += 2
+            break
+        }
+        $pos += $Response[$pos] + 1
+    }
+    if ($Response[$pos] -eq 0) { $pos++ }
+    $pos += 4  # Skip QTYPE and QCLASS
+    
+    # Parse answers
+    $ips = @()
+    for ($i = 0; $i -lt $answerCount -and $pos -lt $Response.Length - 10; $i++) {
+        # Skip name (handle compression)
+        if (($Response[$pos] -band 0xC0) -eq 0xC0) {
+            $pos += 2
+        } else {
+            while ($pos -lt $Response.Length -and $Response[$pos] -ne 0) {
+                $pos += $Response[$pos] + 1
+            }
+            $pos++
+        }
+        
+        if ($pos + 10 -gt $Response.Length) { break }
+        
+        $type = ($Response[$pos] -shl 8) + $Response[$pos + 1]
+        $rdLength = ($Response[$pos + 8] -shl 8) + $Response[$pos + 9]
+        $pos += 10
+        
+        # Type A = 1, rdLength = 4
+        if ($type -eq 1 -and $rdLength -eq 4 -and $pos + 4 -le $Response.Length) {
+            $ip = "$($Response[$pos]).$($Response[$pos+1]).$($Response[$pos+2]).$($Response[$pos+3])"
+            $ips += $ip
+        }
+        
+        $pos += $rdLength
+    }
+    
+    if ($ips.Count -gt 0) { return $ips[0] }
+    return $null
+}
+
 function Invoke-ParallelDnsTest-PS7 {
     param(
         [string[]]$Servers,
@@ -295,7 +407,6 @@ function Invoke-ParallelDnsTest-PS7 {
         [string]$OutputFilePath
     )
     
-    $completed = 0
     $total = $Servers.Count
     $results = [System.Collections.Concurrent.ConcurrentBag[PSObject]]::new()
     $fileLock = [System.Object]::new()
@@ -303,7 +414,7 @@ function Invoke-ParallelDnsTest-PS7 {
     $Servers | ForEach-Object -Parallel {
         $server = $_
         $domain = $using:Domain
-        $timeout = $using:TimeoutSeconds
+        $timeoutMs = $using:TimeoutSeconds * 1000
         $outputFile = $using:OutputFilePath
         $results = $using:results
         $lock = $using:fileLock
@@ -316,47 +427,128 @@ function Invoke-ParallelDnsTest-PS7 {
             Error = $null
         }
         
-        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $udpClient = $null
         
         try {
-            $dnsResult = Resolve-DnsName -Name $domain -Server $server -Type A -DnsOnly -ErrorAction Stop
+            # Build DNS query packet inline (can't call functions from parallel block)
+            $id = [byte[]]@((Get-Random -Maximum 256), (Get-Random -Maximum 256))
+            $flags = [byte[]]@(0x01, 0x00)
+            $counts = [byte[]]@(0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+            
+            $domainBytes = [System.Collections.Generic.List[byte]]::new()
+            foreach ($label in $domain.Split('.')) {
+                $domainBytes.Add([byte]$label.Length)
+                $domainBytes.AddRange([System.Text.Encoding]::ASCII.GetBytes($label))
+            }
+            $domainBytes.Add(0x00)
+            
+            $queryType = [byte[]]@(0x00, 0x01, 0x00, 0x01)
+            
+            $query = [System.Collections.Generic.List[byte]]::new()
+            $query.AddRange($id)
+            $query.AddRange($flags)
+            $query.AddRange($counts)
+            $query.AddRange($domainBytes)
+            $query.AddRange($queryType)
+            $packet = $query.ToArray()
+            
+            # Send UDP query
+            $udpClient = [System.Net.Sockets.UdpClient]::new()
+            $udpClient.Client.ReceiveTimeout = $timeoutMs
+            $udpClient.Client.SendTimeout = $timeoutMs
+            
+            $endpoint = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($server), 53)
+            
+            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            [void]$udpClient.Send($packet, $packet.Length, $endpoint)
+            
+            $remoteEp = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+            $response = $udpClient.Receive([ref]$remoteEp)
             $stopwatch.Stop()
             
-            $aRecords = $dnsResult | Where-Object { $_.Type -eq 'A' }
-            if ($aRecords) {
-                $result.Success = $true
-                $result.ResolvedIP = $aRecords[0].IPAddress
-                $result.ResponseTime = [math]::Round($stopwatch.ElapsedMilliseconds)
-                
-                # Save immediately
-                $line = "$server ($($result.ResponseTime)ms)"
-                [System.Threading.Monitor]::Enter($lock)
-                try {
-                    Add-Content -Path $outputFile -Value $line -Encoding UTF8
-                }
-                finally {
-                    [System.Threading.Monitor]::Exit($lock)
+            # Parse response inline
+            if ($response.Length -ge 12) {
+                if ($response[0] -eq $id[0] -and $response[1] -eq $id[1]) {
+                    $rcode = $response[3] -band 0x0F
+                    $answerCount = ($response[6] -shl 8) + $response[7]
+                    
+                    if ($rcode -eq 0 -and $answerCount -gt 0) {
+                        # Skip to answers
+                        $pos = 12
+                        while ($pos -lt $response.Length -and $response[$pos] -ne 0) {
+                            if (($response[$pos] -band 0xC0) -eq 0xC0) { $pos += 2; break }
+                            $pos += $response[$pos] + 1
+                        }
+                        if ($pos -lt $response.Length -and $response[$pos] -eq 0) { $pos++ }
+                        $pos += 4
+                        
+                        # Parse first answer
+                        if (($response[$pos] -band 0xC0) -eq 0xC0) { $pos += 2 }
+                        else {
+                            while ($pos -lt $response.Length -and $response[$pos] -ne 0) { $pos += $response[$pos] + 1 }
+                            $pos++
+                        }
+                        
+                        if ($pos + 10 -le $response.Length) {
+                            $type = ($response[$pos] -shl 8) + $response[$pos + 1]
+                            $rdLength = ($response[$pos + 8] -shl 8) + $response[$pos + 9]
+                            $pos += 10
+                            
+                            if ($type -eq 1 -and $rdLength -eq 4 -and $pos + 4 -le $response.Length) {
+                                $result.Success = $true
+                                $result.ResolvedIP = "$($response[$pos]).$($response[$pos+1]).$($response[$pos+2]).$($response[$pos+3])"
+                                $result.ResponseTime = [math]::Round($stopwatch.ElapsedMilliseconds)
+                                
+                                $line = "$server ($($result.ResponseTime)ms)"
+                                [System.Threading.Monitor]::Enter($lock)
+                                try { Add-Content -Path $outputFile -Value $line -Encoding UTF8 }
+                                finally { [System.Threading.Monitor]::Exit($lock) }
+                            }
+                        }
+                    }
+                    else {
+                        $result.Error = "RCODE: $rcode"
+                    }
                 }
             }
+            
+            if (-not $result.Success -and -not $result.Error) {
+                $result.Error = "No answer"
+            }
+        }
+        catch [System.Net.Sockets.SocketException] {
+            $result.Error = "Timeout"
         }
         catch {
-            $stopwatch.Stop()
-            $result.ResponseTime = [math]::Round($stopwatch.ElapsedMilliseconds)
             $errMsg = $_.Exception.Message
             if ($errMsg.Length -gt 30) { $errMsg = $errMsg.Substring(0, 30) + "..." }
             $result.Error = $errMsg
         }
+        finally {
+            if ($udpClient) { $udpClient.Close() }
+        }
         
         $results.Add([PSCustomObject]$result)
         
-        # Progress update
+        # Print result with color
         $done = $results.Count
         $pct = [math]::Round(($done / $using:total) * 100, 1)
-        Write-Host "`rProgress: $done/$($using:total) ($pct%)" -NoNewline
+        $progressInfo = "[$done/$($using:total) $pct%]"
+        
+        if ($result.Success) {
+            Write-Host "`r$progressInfo " -NoNewline
+            Write-Host "OK " -ForegroundColor Green -NoNewline
+            Write-Host "$server $($result.ResponseTime)ms ($($result.ResolvedIP))"
+        }
+        else {
+            $errInfo = if ($result.Error) { $result.Error } else { "timeout/error" }
+            Write-Host "`r$progressInfo " -NoNewline
+            Write-Host "FAIL " -ForegroundColor Red -NoNewline
+            Write-Host "$server ($errInfo)"
+        }
         
     } -ThrottleLimit $Workers
     
-    Write-Host ""  # New line after progress
     return $results.ToArray()
 }
 
@@ -377,7 +569,7 @@ function Invoke-ParallelDnsTest-PS5 {
     $results = [System.Collections.Concurrent.ConcurrentBag[PSObject]]::new()
     
     $scriptBlock = {
-        param($Server, $Domain, $TimeoutSeconds, $OutputFilePath)
+        param($Server, $Domain, $TimeoutMs, $OutputFilePath)
         
         $result = @{
             Server = $Server
@@ -387,95 +579,141 @@ function Invoke-ParallelDnsTest-PS5 {
             Error = $null
         }
         
-        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $udpClient = $null
         
         try {
-            if (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue) {
-                $dnsResult = Resolve-DnsName -Name $Domain -Server $Server -Type A -DnsOnly -ErrorAction Stop
-                $stopwatch.Stop()
-                
-                $aRecords = $dnsResult | Where-Object { $_.Type -eq 'A' }
-                if ($aRecords) {
-                    $result.Success = $true
-                    $result.ResolvedIP = $aRecords[0].IPAddress
-                    $result.ResponseTime = [math]::Round($stopwatch.ElapsedMilliseconds)
+            # Build DNS query packet
+            $id = [byte[]]@((Get-Random -Maximum 256), (Get-Random -Maximum 256))
+            $flags = [byte[]]@(0x01, 0x00)
+            $counts = [byte[]]@(0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+            
+            $domainBytes = [System.Collections.Generic.List[byte]]::new()
+            foreach ($label in $Domain.Split('.')) {
+                $domainBytes.Add([byte]$label.Length)
+                $domainBytes.AddRange([System.Text.Encoding]::ASCII.GetBytes($label))
+            }
+            $domainBytes.Add(0x00)
+            
+            $queryType = [byte[]]@(0x00, 0x01, 0x00, 0x01)
+            
+            $query = [System.Collections.Generic.List[byte]]::new()
+            $query.AddRange($id)
+            $query.AddRange($flags)
+            $query.AddRange($counts)
+            $query.AddRange($domainBytes)
+            $query.AddRange($queryType)
+            $packet = $query.ToArray()
+            
+            # Send UDP query
+            $udpClient = [System.Net.Sockets.UdpClient]::new()
+            $udpClient.Client.ReceiveTimeout = $TimeoutMs
+            $udpClient.Client.SendTimeout = $TimeoutMs
+            
+            $endpoint = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($Server), 53)
+            
+            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            [void]$udpClient.Send($packet, $packet.Length, $endpoint)
+            
+            $remoteEp = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+            $response = $udpClient.Receive([ref]$remoteEp)
+            $stopwatch.Stop()
+            
+            # Parse response
+            if ($response.Length -ge 12) {
+                if ($response[0] -eq $id[0] -and $response[1] -eq $id[1]) {
+                    $rcode = $response[3] -band 0x0F
+                    $answerCount = ($response[6] -shl 8) + $response[7]
                     
-                    # Save immediately (atomic append)
-                    $line = "$Server ($($result.ResponseTime)ms)"
-                    [System.IO.File]::AppendAllText($OutputFilePath, "$line`r`n")
+                    if ($rcode -eq 0 -and $answerCount -gt 0) {
+                        # Skip to answers
+                        $pos = 12
+                        while ($pos -lt $response.Length -and $response[$pos] -ne 0) {
+                            if (($response[$pos] -band 0xC0) -eq 0xC0) { $pos += 2; break }
+                            $pos += $response[$pos] + 1
+                        }
+                        if ($pos -lt $response.Length -and $response[$pos] -eq 0) { $pos++ }
+                        $pos += 4
+                        
+                        # Parse first answer
+                        if (($response[$pos] -band 0xC0) -eq 0xC0) { $pos += 2 }
+                        else {
+                            while ($pos -lt $response.Length -and $response[$pos] -ne 0) { $pos += $response[$pos] + 1 }
+                            $pos++
+                        }
+                        
+                        if ($pos + 10 -le $response.Length) {
+                            $type = ($response[$pos] -shl 8) + $response[$pos + 1]
+                            $rdLength = ($response[$pos + 8] -shl 8) + $response[$pos + 9]
+                            $pos += 10
+                            
+                            if ($type -eq 1 -and $rdLength -eq 4 -and $pos + 4 -le $response.Length) {
+                                $result.Success = $true
+                                $result.ResolvedIP = "$($response[$pos]).$($response[$pos+1]).$($response[$pos+2]).$($response[$pos+3])"
+                                $result.ResponseTime = [math]::Round($stopwatch.ElapsedMilliseconds)
+                                
+                                $line = "$Server ($($result.ResponseTime)ms)"
+                                $mutex = [System.Threading.Mutex]::new($false, "Global\AzadiDNSTesterFileLock")
+                                $mutex.WaitOne() | Out-Null
+                                try { [System.IO.File]::AppendAllText($OutputFilePath, "$line`r`n") }
+                                finally { $mutex.ReleaseMutex(); $mutex.Dispose() }
+                            }
+                        }
+                    }
+                    else {
+                        $result.Error = "RCODE: $rcode"
+                    }
                 }
             }
-            else {
-                # Fallback to nslookup
-                $psi = New-Object System.Diagnostics.ProcessStartInfo
-                $psi.FileName = "nslookup"
-                $psi.Arguments = "$Domain $Server"
-                $psi.RedirectStandardOutput = $true
-                $psi.RedirectStandardError = $true
-                $psi.UseShellExecute = $false
-                $psi.CreateNoWindow = $true
-                
-                $process = New-Object System.Diagnostics.Process
-                $process.StartInfo = $psi
-                $process.Start() | Out-Null
-                
-                $completed = $process.WaitForExit($TimeoutSeconds * 1000)
-                $stopwatch.Stop()
-                
-                if ($completed -and $process.ExitCode -eq 0) {
-                    $output = $process.StandardOutput.ReadToEnd()
-                    $addresses = [regex]::Matches($output, 'Address:\s*(\d+\.\d+\.\d+\.\d+)')
-                    if ($addresses.Count -gt 1) {
-                        $result.Success = $true
-                        $result.ResolvedIP = $addresses[1].Groups[1].Value
-                        $result.ResponseTime = [math]::Round($stopwatch.ElapsedMilliseconds)
-                        
-                        $line = "$Server ($($result.ResponseTime)ms)"
-                        [System.IO.File]::AppendAllText($OutputFilePath, "$line`r`n")
-                    }
-                }
-                else {
-                    if (-not $completed) {
-                        $process.Kill()
-                        $result.Error = "Timeout"
-                    }
-                }
+            
+            if (-not $result.Success -and -not $result.Error) {
+                $result.Error = "No answer"
             }
         }
+        catch [System.Net.Sockets.SocketException] {
+            $result.Error = "Timeout"
+        }
         catch {
-            $stopwatch.Stop()
-            $result.ResponseTime = [math]::Round($stopwatch.ElapsedMilliseconds)
             $errMsg = $_.Exception.Message
             if ($errMsg.Length -gt 30) { $errMsg = $errMsg.Substring(0, 30) + "..." }
             $result.Error = $errMsg
+        }
+        finally {
+            if ($udpClient) { $udpClient.Close() }
         }
         
         return [PSCustomObject]$result
     }
     
-    # Start all jobs
-    foreach ($server in $Servers) {
+    # Throttled job creation
+    $total = $Servers.Count
+    $allResults = @()
+    $completed = 0
+    $index = 0
+    $timeoutMs = $TimeoutSeconds * 1000
+
+    function Start-OneJob {
+        param([string]$Server)
         $powershell = [powershell]::Create().AddScript($scriptBlock)
-        $powershell.AddArgument($server)
+        $powershell.AddArgument($Server)
         $powershell.AddArgument($Domain)
-        $powershell.AddArgument($TimeoutSeconds)
+        $powershell.AddArgument($timeoutMs)
         $powershell.AddArgument($OutputFilePath)
         $powershell.RunspacePool = $runspacePool
-        
-        $jobs += @{
+        return @{
             PowerShell = $powershell
             Handle = $powershell.BeginInvoke()
         }
     }
-    
-    # Wait for completion with progress
-    $total = $jobs.Count
-    $allResults = @()
-    $completed = 0
-    
+
+    # Prime initial batch
+    while ($jobs.Count -lt $Workers -and $index -lt $total) {
+        $jobs += Start-OneJob -Server $Servers[$index]
+        $index++
+    }
+
     while ($jobs.Count -gt 0) {
         $finishedJobs = @()
-        
+
         foreach ($job in $jobs) {
             if ($job.Handle.IsCompleted) {
                 $result = $job.PowerShell.EndInvoke($job.Handle)
@@ -483,22 +721,38 @@ function Invoke-ParallelDnsTest-PS5 {
                 $job.PowerShell.Dispose()
                 $finishedJobs += $job
                 $completed++
+
+                # Print result with color
+                $pct = if ($total -gt 0) { [math]::Round(($completed / $total) * 100, 1) } else { 100 }
+                $progressInfo = "[$completed/$total $pct%]"
                 
-                $pct = [math]::Round(($completed / $total) * 100, 1)
-                Write-Host "`rProgress: $completed/$total ($pct%)" -NoNewline
+                if ($result.Success) {
+                    Write-Host "$progressInfo " -NoNewline
+                    Write-Host "OK " -ForegroundColor Green -NoNewline
+                    Write-Host "$($result.Server) $($result.ResponseTime)ms ($($result.ResolvedIP))"
+                }
+                else {
+                    $errInfo = if ($result.Error) { $result.Error } else { "timeout/error" }
+                    Write-Host "$progressInfo " -NoNewline
+                    Write-Host "FAIL " -ForegroundColor Red -NoNewline
+                    Write-Host "$($result.Server) ($errInfo)"
+                }
+
+                if ($index -lt $total) {
+                    $jobs += Start-OneJob -Server $Servers[$index]
+                    $index++
+                }
             }
         }
-        
+
         foreach ($finished in $finishedJobs) {
             $jobs = $jobs | Where-Object { $_ -ne $finished }
         }
-        
+
         if ($jobs.Count -gt 0) {
-            Start-Sleep -Milliseconds 100
+            Start-Sleep -Milliseconds 50
         }
     }
-    
-    Write-Host ""  # New line after progress
     $runspacePool.Close()
     $runspacePool.Dispose()
     
@@ -524,21 +778,29 @@ function Main {
         Write-ColorOutput "Parallel Mode: Runspace Pool (PS5.1 compatible)" -Color Cyan
     }
     
-    # Check for Resolve-DnsName
-    if (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue) {
-        Write-ColorOutput "DNS Tool: Resolve-DnsName" -Color Cyan
-    }
-    else {
-        Write-ColorOutput "DNS Tool: nslookup (fallback)" -Color Yellow
-    }
+    # Tool info (using raw UDP for accurate timing)
+    Write-ColorOutput "DNS Tool: Raw UDP (port 53)" -Color Cyan
     
     # Load servers
+    Write-Host ""
+    Write-ColorOutput "Input file: $InputFile" -Color Cyan
+    try {
+        if (Test-Path $InputFile) {
+            $size = (Get-Item -LiteralPath $InputFile).Length
+            Write-ColorOutput ("Input size: {0:N0} bytes" -f $size) -Color Cyan
+        }
+    }
+    catch {
+        # Ignore size errors (e.g., permission issues)
+    }
+
     if (-not (Test-Path $InputFile)) {
         Write-Host "$InputFile not found. Creating sample file..."
         New-SampleFile -FilePath $InputFile
     }
     
     # Extract unique IPs
+    Write-Host "Reading and extracting IPv4 addresses... (this can take a bit for large files)"
     $ipData = Get-IPv4Addresses -FilePath $InputFile
     $servers = $ipData.UniqueIPs
     
@@ -590,17 +852,6 @@ function Main {
     # Process results
     $working = @($results | Where-Object { $_.Success })
     $failed = @($results | Where-Object { -not $_.Success })
-    
-    # Display individual results
-    foreach ($result in $results) {
-        if ($result.Success) {
-            Write-ColorOutput "✅ $($result.Server) OK $($result.ResponseTime)ms ($($result.ResolvedIP))" -Color Green
-        }
-        else {
-            $errInfo = if ($result.Error) { $result.Error } else { "timeout/error" }
-            Write-ColorOutput "❌ $($result.Server) FAIL ($errInfo)" -Color Red
-        }
-    }
     
     # Calculate statistics
     $successRate = if ($servers.Count -gt 0) { [math]::Round(($working.Count / $servers.Count) * 100, 1) } else { 0 }

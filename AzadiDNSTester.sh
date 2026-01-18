@@ -463,14 +463,18 @@ response_time=$((end_time - start_time))
 
 if [[ $status -eq 0 && -n "$resolved_ip" ]]; then
     echo "$server (${response_time}ms)" >> "$output_file"
+    # Print green success message immediately
+    printf "\r\033[K\033[0;32m✅ %s OK %sms (%s)\033[0m\n" "$server" "$response_time" "$resolved_ip" >&2
     echo "OK|$server|$response_time|$resolved_ip"
 else
+    # Print red failure message immediately
+    printf "\r\033[K\033[0;31m❌ %s FAIL (%sms)\033[0m\n" "$server" "$response_time" >&2
     echo "FAIL|$server|$response_time"
 fi
 WORKERSCRIPT
     chmod +x "$worker_script"
     
-    # Start progress monitor in background
+    # Start progress monitor in background (prints to stderr to not interfere with results)
     (
         while true; do
             if [[ -f "$temp_results" ]]; then
@@ -484,7 +488,7 @@ WORKERSCRIPT
                     pct=0
                 fi
                 printf "\rProgress: %s/%s (%s%%) | Working: %s   " \
-                    "$done_count" "$total_servers" "$pct" "$working"
+                    "$done_count" "$total_servers" "$pct" "$working" >&2
             fi
             sleep 0.5
         done
@@ -506,22 +510,21 @@ WORKERSCRIPT
     final_working=$(grep -c "^OK|" "$temp_results" 2>/dev/null || echo 0)
     final_working=${final_working:-0}
     printf "\rProgress: %s/%s (100%%) | Working: %s   \n" \
-        "$final_count" "$total_servers" "$final_working"
+        "$final_count" "$total_servers" "$final_working" >&2
     
     rm -f "$servers_file" "$worker_script"
     
+    echo ""
     echo "Processing results..."
     
-    # Process results
+    # Process results (already printed in real-time, just count and collect for sorting)
     while IFS='|' read -r status server response_time extra; do
         if [[ "$status" == "OK" ]]; then
             ((working_count++))
             working_servers+=("$server")
             working_times+=("$response_time")
-            echo -e "${GREEN}✅ $server OK ${response_time}ms ($extra)${NC}"
         else
             ((failed_count++))
-            echo -e "${RED}❌ $server FAIL (${response_time}ms)${NC}"
         fi
     done < "$temp_results"
     
